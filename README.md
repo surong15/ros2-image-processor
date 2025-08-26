@@ -424,6 +424,28 @@ if self.test_mode:
 3. 然後測試AI服務
 4. 最後測試完整流程
 
+
+## 🏷️ 程式預設名稱說明
+
+本程式部分參數有預設值，若未在設定檔或GUI中修改，將採用以下預設：
+
+| 參數            | 預設值                          | 說明                     |
+|-----------------|----------------------------------|--------------------------|
+| 圖像話題        | `/baymax/camera/image_raw`       | ROS2攝像頭話題           |
+| TF話題          | `/baymax/tf`                     | ROS2 TF座標話題          |
+| 目標座標框架    | `tn__7R05D00002_only_bottom_sim_`| 機器人基座座標系         |
+| Collection Name | `ros2_camera_images`             | 向量資料庫集合名稱       |
+| Milvus Host     | `localhost`                      | Milvus伺服器主機         |
+| Milvus Port     | `19530`                          | Milvus伺服器端口         |
+| Qdrant Host     | `localhost`                      | Qdrant伺服器主機         |
+| Qdrant Port     | `6333`                           | Qdrant伺服器端口         |
+| Web Viewer Port | `8889`                           | Web查看器預設端口        |
+| AI模型名稱      | `llava:latest`                   | Ollama LLaVA模型         |
+
+如需自訂，請於GUI或`config.yaml`中修改上述參數。
+
+---
+
 ## 📝 配置文件範例
 
 創建 `config.yaml` 文件:
@@ -440,7 +462,7 @@ milvus_host: 'localhost'
 milvus_port: '19530'
 qdrant_host: 'localhost'
 qdrant_port: '6333'
-collection_name: 'my_robot_images'
+collection_name: 'ros2_camera_images'
 
 # AI分析設定
 ollama_url: 'http://localhost:11434'
