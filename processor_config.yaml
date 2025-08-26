@@ -1,0 +1,29 @@
+# external_processor/config/processor_config.yaml
+# ROS2 Topics
+image_topic: "/baymax/camera/image_raw"
+tf_topic: "/baymax/tf"
+target_frame: "tn__7R05D00002_only_bottom_sim_"
+
+# Ollama VLM Settings
+ollama_url: "http://localhost:11434"
+ollama_model: "llava-phi3:latest"
+ai_timeout: 30
+enable_ai_analysis: true
+
+# Milvus Database Settings
+database_type: "milvus" 
+milvus_host: "localhost"
+milvus_port: "19530"
+collection_name: "image_collection"
+vector_dim: 512
+
+# Processing Settings
+storage_interval: 5.0          # 存儲間隔(秒)
+processing_frequency: 2.0      # 處理頻率(Hz)
+web_viewer_port: 8889          # Web查看器端口
+
+# Qdrant Database Settings
+database_type: "qdrant"  # 或 "milvus"
+qdrant_host: "localhost"
+qdrant_port: "6333"
+qdrant_collection_name: "image_collection"
