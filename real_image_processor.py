@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # milvus一直斷線，好像比之前嚴重
 # web查看器不會根據時間順序排序
+# 用web socket取得realsense畫面，八樓baymax座標
 
 """
 ROS2 Image Processor GUI Application
@@ -11,6 +12,8 @@ ROS2 Image Processor GUI Application
 import sys
 import os
 import threading
+import multiprocessing
+import websocket
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
@@ -51,14 +54,23 @@ if not check_numpy_compatibility():
 
 import numpy as np
 
+
+# WebSocket imports
+try:
+    import websockets
+    import asyncio
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("❌ WebSocket libraries not available. Install: pip install websockets")
+
 # ROS2 imports
 try:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import Image as ROS_Image
     from cv_bridge import CvBridge
-    from tf2_msgs.msg import TFMessage
-    from geometry_msgs.msg import TransformStamped
+    from nav_msgs.msg import Odometry 
     ROS2_AVAILABLE = True
 except ImportError as e:
     ROS2_AVAILABLE = False
@@ -142,21 +154,292 @@ class StatusManager:
     def __init__(self):
         self.ros2_connected = False
         self.image_received = False
-        self.tf_received = False
+        self.odometry_received = False
         self.milvus_connected = False
         self.qdrant_connected = False
         self.ollama_connected = False
         self.storage_active = False
         
         self.image_count = 0
-        self.tf_count = 0
+        self.odometry_count = 0
         self.stored_count = 0
         self.error_count = 0
         
         self.last_image_time = None
-        self.last_tf_time = None
+        self.last_odometry_time = None
         self.last_storage_time = None
 
+class WebSocketCameraSubscriber:
+    """WebSocket 相机影像订阅器"""
+    
+    def __init__(self, topic_name: str, websocket_url: str, status_queue: queue.Queue):
+        self.topic_name = topic_name
+        self.websocket_url = websocket_url
+        self.status_queue = status_queue
+        self.latest_image = None
+        self.latest_timestamp = None
+        self.image_lock = threading.Lock()
+        self.frame_count = 0
+        self.running = True
+        self.bridge = CvBridge()
+        # multiprocessing queue for image data
+        self.mp_queue = multiprocessing.Queue()
+        self.ws_process = multiprocessing.Process(target=self._run_websocket_process, args=(self.mp_queue,), daemon=True)
+        self.ws_process.start()
+        # 啟動資料接收 thread
+        self.recv_thread = threading.Thread(target=self._recv_images_from_queue, daemon=True)
+        self.recv_thread.start()
+        self.status_queue.put(('log', f"✅ WebSocket Image subscriber created: {topic_name} (multiprocessing)"))
+    
+    def _run_websocket_process(self, mp_queue):
+        """multiprocessing process: asyncio websockets client"""
+        import asyncio
+        import websockets
+        import base64, json, time
+        async def ws_loop():
+            print(f"[WebSocket] Connecting to {self.websocket_url} ... (multiprocessing)")
+            try:
+                async with websockets.connect(self.websocket_url, max_size=16*1024*1024) as websocket:
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "topic": self.topic_name,
+                        "type": "sensor_msgs/Image",
+                        "compression": "none",
+                        "throttle_rate": 1000,
+                        "queue_length": 10
+                    }
+                    await websocket.send(json.dumps(subscribe_msg))
+                    last_time = time.time()
+                    while True:
+                        message = await websocket.recv()
+                        recv_time = time.time()
+                        try:
+                            data = json.loads(message)
+                            if data.get("topic") == self.topic_name and "msg" in data:
+                                mp_queue.put((recv_time, message))
+                        except Exception as e:
+                            print(f"[WebSocket] 子進程解析例外: {e}")
+            except Exception as e:
+                print(f"[WebSocket] 子進程連線異常: {e}")
+        asyncio.run(ws_loop())
+
+    def _recv_images_from_queue(self):
+        """主程式 thread: 從 mp_queue 收資料並處理"""
+        last_time = time.time()
+        while self.running:
+            try:
+                recv_time, message = self.mp_queue.get()
+                data = json.loads(message)
+                if data.get("topic") == self.topic_name and "msg" in data:
+                    t0 = time.time()
+                    self._process_image_message(data["msg"])
+                    t1 = time.time()
+                    dt = t1 - t0
+                    interval = recv_time - last_time
+                    last_time = recv_time
+                    print(f"[WebSocket] 收到圖片 frame={self.frame_count} 間隔={interval:.3f}s 處理={dt:.3f}s 大小={len(message)} bytes")
+            except Exception as e:
+                print(f"[WebSocket] 主程式解析例外: {e}")
+    
+    async def _websocket_loop(self):
+        """WebSocket主循环"""
+        try:
+            print(f"[WebSocket] Connecting to {self.websocket_url} ...")
+            async with websockets.connect(self.websocket_url, max_size=16*1024*1024) as websocket:
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "topic": self.topic_name,
+                    "type": "sensor_msgs/Image",
+                    "compression": "none",
+                    "throttle_rate": 10,
+                    "queue_length": 10
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                self.running = True
+                last_time = time.time()
+                async for message in websocket:
+                    if not self.running:
+                        break
+                    recv_time = time.time()
+                    try:
+                        data = json.loads(message)
+                        if data.get("topic") == self.topic_name and "msg" in data:
+                            t0 = time.time()
+                            self._process_image_message(data["msg"])
+                            t1 = time.time()
+                            dt = t1 - t0
+                            interval = recv_time - last_time
+                            last_time = recv_time
+                            print(f"[WebSocket] 收到圖片 frame={self.frame_count} 間隔={interval:.3f}s 處理={dt:.3f}s 大小={len(message)} bytes")
+                    except Exception as e:
+                        print(f"[WebSocket] 圖片處理例外: {e}")
+                        self.status_queue.put(('error', f"WebSocket image processing error: {e}"))
+        except Exception as e:
+            print(f"[WebSocket] 連線異常: {e}")
+            self.status_queue.put(('error', f"WebSocket camera connection error: {e}"))
+    
+    def _process_image_message(self, msg):
+        """处理图像消息"""
+        try:
+            width = msg['width']
+            height = msg['height']
+            encoding = msg['encoding']
+            data_b64 = msg['data']
+            data = base64.b64decode(data_b64)
+            expected_len = width * height * 3
+            if len(data) != expected_len:
+                print(f"[WebSocket] 圖片資料長度異常: {len(data)} != {expected_len}")
+            # 只處理 rgb8/bgr8
+            if encoding == 'rgb8':
+                cv_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            elif encoding == 'bgr8':
+                cv_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+                cv_image = cv_image[:, :, ::-1]
+            else:
+                cv_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, -1))
+            with self.image_lock:
+                self.latest_image = cv_image
+                self.latest_timestamp = datetime.now()
+                self.frame_count += 1
+            self.status_queue.put(('image_received', {
+                'count': self.frame_count,
+                'timestamp': self.latest_timestamp,
+                'shape': cv_image.shape
+            }))
+        except Exception as e:
+            print(f"❌ [WebSocket] Image processing error: {e}")
+            self.status_queue.put(('error', f"Image processing error: {e}"))
+    
+    def get_latest_image(self):
+        with self.image_lock:
+            if self.latest_image is not None:
+                return self.latest_image.copy(), self.latest_timestamp
+            return None, None
+    
+    def stop(self):
+        """停止WebSocket连接"""
+        self.running = False
+        if hasattr(self, 'ws_process') and self.ws_process.is_alive():
+            self.ws_process.terminate()
+
+class WebSocketOdometrySubscriber:
+    """WebSocket Odometry 订阅器"""
+    
+    def __init__(self, topic_name: str, websocket_url: str, status_queue: queue.Queue):
+        self.topic_name = topic_name
+        self.websocket_url = websocket_url
+        self.status_queue = status_queue
+        self.latest_odometry = None
+        self.latest_timestamp = None
+        self.odometry_lock = threading.Lock()
+        self.odometry_count = 0
+        self.running = False
+        
+        # 启动WebSocket连接线程
+        self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+        self.ws_thread.start()
+        
+        self.status_queue.put(('log', f"✅ WebSocket Odometry subscriber created: {topic_name}"))
+    
+    def _run_websocket(self):
+        """运行WebSocket客户端"""
+        asyncio.run(self._websocket_loop())
+    
+    async def _websocket_loop(self):
+        """WebSocket主循环"""
+        try:
+            async with websockets.connect(self.websocket_url, max_size=4*1024*1024) as websocket:
+                # 订阅topic
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "topic": self.topic_name,
+                    "type": "nav_msgs/Odometry"
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                self.running = True
+                
+                async for message in websocket:
+                    if not self.running:
+                        break
+                    
+                    try:
+                        data = json.loads(message)
+                        if data.get("topic") == self.topic_name and "msg" in data:
+                            self._process_odometry_message(data["msg"])
+                    except Exception as e:
+                        self.status_queue.put(('error', f"WebSocket odometry processing error: {e}"))
+                        
+        except Exception as e:
+            self.status_queue.put(('error', f"WebSocket odometry connection error: {e}"))
+    
+    def _process_odometry_message(self, msg):
+        """处理里程计消息"""
+        try:
+            self.odometry_count += 1
+            system_timestamp = datetime.now()
+            
+            with self.odometry_lock:
+                self.latest_odometry = msg  # 直接存储WebSocket消息
+                self.latest_timestamp = system_timestamp
+
+            # 提取位置信息
+            pose = msg['pose']['pose']
+            position = pose['position']
+            orientation = pose['orientation']
+
+            # Terminal 输出
+            if self.odometry_count <= 3 or self.odometry_count % 50 == 0:
+                print(f"📍 [WebSocket] Received odometry #{self.odometry_count}")
+                print(f"📍 [WebSocket] Position: [{position['x']:.3f}, {position['y']:.3f}, {position['z']:.3f}]")
+                print(f"📍 [WebSocket] Orientation: [{orientation['w']:.3f}, {orientation['x']:.3f}, {orientation['y']:.3f}, {orientation['z']:.3f}]")
+            
+            # 更新状态
+            self.status_queue.put(('odometry_received', {
+                'count': self.odometry_count,
+                'timestamp': system_timestamp,
+                'position': [position['x'], position['y'], position['z']],
+                'orientation': [orientation['w'], orientation['x'], orientation['y'], orientation['z']]
+            }))
+            
+        except Exception as e:
+            print(f"⚠ [WebSocket] Odometry processing error: {e}")
+            self.status_queue.put(('error', f"Odometry processing error: {e}"))
+
+    def get_latest_odometry(self, max_age_seconds=2.0):
+        with self.odometry_lock:
+            if self.latest_odometry is not None:
+                return self.latest_odometry, self.latest_timestamp
+            return None, None
+    
+    def extract_coordinates(self, odometry_msg):
+        """从WebSocket消息提取坐标"""
+        try:
+            pose = odometry_msg['pose']['pose']
+            position = pose['position']
+            orientation = pose['orientation']
+            
+            position_list = [float(position['x']), float(position['y']), float(position['z'])]
+            rotation_quat = [float(orientation['w']), float(orientation['x']), 
+                           float(orientation['y']), float(orientation['z'])]
+            
+            return {
+                'position': position_list,
+                'rotation': rotation_quat,
+                'coordinate_frame': 'amcl_pose_ws',
+                'method': 'websocket_odometry'
+            }
+        except Exception as e:
+            return {
+                'position': [0.0, 0.0, 0.0],
+                'rotation': [1.0, 0.0, 0.0, 0.0],
+                'coordinate_frame': 'error',
+                'method': 'error'
+            }
+    
+    def stop(self):
+        """停止WebSocket连接"""
+        self.running = False
+        
 class ROS2CameraSubscriber(Node):
     """ROS2 相機影像訂閱器"""
     
@@ -210,88 +493,86 @@ class ROS2CameraSubscriber(Node):
                 return self.latest_image.copy(), self.latest_timestamp
             return None, None
 
-class ROS2TFSubscriber(Node):
-    """ROS2 TF 變換訂閱器"""
+class ROS2OdometrySubscriber(Node):
+    """ROS2 Odometry 訂閱器"""
     
-    def __init__(self, tf_topic: str, target_frame: str, status_queue: queue.Queue):
-        super().__init__('gui_tf_subscriber')
-        self.tf_topic = tf_topic
-        self.target_frame = target_frame
+    def __init__(self, odometry_topic: str, status_queue: queue.Queue):
+        super().__init__('gui_odometry_subscriber')
+        self.odometry_topic = odometry_topic
         self.status_queue = status_queue
-        self.latest_transform = None
+        self.latest_odometry = None
         self.latest_timestamp = None
-        self.tf_lock = threading.Lock()
-        self.tf_count = 0
-        self.found_target = False
+        self.odometry_lock = threading.Lock()
+        self.odometry_count = 0
         
-        # 創建 TF 訂閱器
+        # 創建 Odometry 訂閱器
         self.subscription = self.create_subscription(
-            TFMessage,
-            tf_topic,
-            self.tf_callback,
+            Odometry,
+            odometry_topic,
+            self.odometry_callback,
             10
         )
         
-        self.status_queue.put(('log', f"✅ TF subscriber created: {tf_topic}, target: {target_frame}"))
+        self.status_queue.put(('log', f"✅ Odometry subscriber created: {odometry_topic}"))
     
-    def tf_callback(self, msg):
+    def odometry_callback(self, msg):
         try:
-            self.tf_count += 1
+            self.odometry_count += 1
             system_timestamp = datetime.now()
             
-            # 尋找目標 frame
-            found = False
-            for transform in msg.transforms:
-                if transform.child_frame_id == self.target_frame:
-                    with self.tf_lock:
-                        self.latest_transform = transform
-                        self.latest_timestamp = system_timestamp
-                    found = True
-                    if not self.found_target:
-                        self.found_target = True
-                        print(f"📡 [ROS2] ✅ Found target frame: {self.target_frame}")
-                    break
-            
+            with self.odometry_lock:
+                self.latest_odometry = msg
+                self.latest_timestamp = system_timestamp
+
+            pose = msg.pose.pose
+
             # Terminal 輸出（減少頻率）
-            if self.tf_count <= 3:
-                available_frames = [t.child_frame_id for t in msg.transforms]
-                print(f"📡 [ROS2] TF message #{self.tf_count} with {len(msg.transforms)} transforms")
-                print(f"📡 [ROS2] Available frames: {available_frames[:5]}...")
-                print(f"📡 [ROS2] Looking for target: '{self.target_frame}' - {'✅ Found' if found else '❌ Not found'}")
-            elif self.tf_count % 100 == 0:
-                print(f"📡 [ROS2] TF messages received: {self.tf_count} (target: {'✅' if self.found_target else '❌'})")
+            if self.odometry_count <= 3 or self.odometry_count % 50 == 0:
+                print(f"📍 [ROS2] Received odometry #{self.odometry_count}")
+                print(f"📍 [ROS2] Position: [{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}]")
+                print(f"📍 [ROS2] Orientation: [{pose.orientation.w:.3f}, {pose.orientation.x:.3f}, {pose.orientation.y:.3f}, {pose.orientation.z:.3f}]")
             
             # 更新狀態
-            self.status_queue.put(('tf_received', {
-                'count': self.tf_count,
+            self.status_queue.put(('odometry_received', {
+                'count': self.odometry_count,
                 'timestamp': system_timestamp,
-                'found_target': found,
-                'available_frames': [t.child_frame_id for t in msg.transforms][:5]
+                'position': [pose.position.x, pose.position.y, pose.position.z],
+                'orientation': [pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z]
             }))
             
         except Exception as e:
-            print(f"❌ [ROS2] TF callback error: {e}")
-            self.status_queue.put(('error', f"TF callback error: {e}"))
+            print(f"⚠ [ROS2] Odometry callback error: {e}")
+            self.status_queue.put(('error', f"Odometry callback error: {e}"))
     
-    def get_latest_transform(self):
-        with self.tf_lock:
-            if self.latest_transform is not None:
-                return self.latest_transform, self.latest_timestamp
+    def get_latest_odometry(self, max_age_seconds=2.0):  # 添加最大時效參數
+        with self.odometry_lock:
+            if self.latest_odometry is not None and self.latest_timestamp is not None:
+                # 檢查數據是否在有效時間內
+                current_time = datetime.now()
+                time_diff = (current_time - self.latest_timestamp).total_seconds()
+                
+                if time_diff <= max_age_seconds:
+                    return self.latest_odometry, self.latest_timestamp
+                else:
+                    # 數據過期，返回 None
+                    print(f"📡 [ROS2] Odometry data expired ({time_diff:.2f}s old)")
+                    return None, None
             return None, None
     
-    def extract_coordinates(self, transform_msg):
+    def extract_coordinates(self, odometry_msg):
         try:
-            translation = transform_msg.transform.translation
-            rotation = transform_msg.transform.rotation
+            pose = odometry_msg.pose.pose
+            position = pose.position
+            orientation = pose.orientation
             
-            position = [float(translation.x), float(translation.y), float(translation.z)]
-            rotation_quat = [float(rotation.w), float(rotation.x), float(rotation.y), float(rotation.z)]
+            position_list = [float(position.x), float(position.y), float(position.z)]
+            rotation_quat = [float(orientation.w), float(orientation.x), float(orientation.y), float(orientation.z)]
             
             return {
-                'position': position,
+                'position': position_list,
                 'rotation': rotation_quat,
-                'coordinate_frame': 'ros2_tf',
-                'method': 'ros2_tf_transform'
+                'coordinate_frame': 'amcl_pose',
+                'method': 'ros2_odometry'
             }
         except Exception as e:
             return {
@@ -525,8 +806,7 @@ class MilvusManager(VectorDBManager):
                 FieldSchema(name="rotation_z", dtype=DataType.DOUBLE),
                 FieldSchema(name="rotation_w", dtype=DataType.DOUBLE),
                 FieldSchema(name="coordinate_frame", dtype=DataType.VARCHAR, max_length=50),
-                FieldSchema(name="tf_topic", dtype=DataType.VARCHAR, max_length=200),
-                FieldSchema(name="target_frame", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="odometry_topic", dtype=DataType.VARCHAR, max_length=200),
                 FieldSchema(name="date", dtype=DataType.VARCHAR, max_length=20),
                 FieldSchema(name="time", dtype=DataType.VARCHAR, max_length=20),
                 FieldSchema(name="capture_method", dtype=DataType.VARCHAR, max_length=50)
@@ -606,8 +886,7 @@ class MilvusManager(VectorDBManager):
                 "rotation_z": data_packet.rotation[3],
                 "rotation_w": data_packet.rotation[0],
                 "coordinate_frame": data_packet.coordinate_frame,
-                "tf_topic": self.config.get('tf_topic', 'unknown'),
-                "target_frame": self.config.get('target_frame', 'unknown'),
+                "odometry_topic": self.config.get('odometry_topic', 'unknown'),
                 "date": data_packet.timestamp.strftime("%Y-%m-%d"),
                 "time": data_packet.timestamp.strftime("%H:%M:%S"),
                 "capture_method": "ros2_gui_application"
@@ -818,8 +1097,8 @@ class QdrantManager(VectorDBManager):
             return False
         
         try:
-            print(f"💾 [Qdrant] Starting storage for frame_{data_packet.frame_id}...")
-            
+            print(f"💾 [Qdrant] Starting storage for frame_{data_packet.frame_id}...，time: {datetime.now()}")
+
             # 生成向量
             image_vector = self._image_to_vector(data_packet.image)
             print(f"💾 [Qdrant] Generated feature vector (dim: {len(image_vector)})")
@@ -855,8 +1134,7 @@ class QdrantManager(VectorDBManager):
                     "rotation_z": data_packet.rotation[3],
                     "rotation_w": data_packet.rotation[0],
                     "coordinate_frame": data_packet.coordinate_frame,
-                    "tf_topic": self.config.get('tf_topic', 'unknown'),
-                    "target_frame": self.config.get('target_frame', 'unknown'),
+                    "odometry_topic": self.config.get('odometry_topic', 'unknown'),
                     "date": data_packet.timestamp.strftime("%Y-%m-%d"),
                     "time": data_packet.timestamp.strftime("%H:%M:%S"),
                     "capture_method": "ros2_gui_application",
@@ -874,7 +1152,7 @@ class QdrantManager(VectorDBManager):
             
             # Terminal 輸出存儲結果
             print("💾 " + "="*50)
-            print(f"💾 [Qdrant] ✅ Successfully stored frame_{data_packet.frame_id}")
+            print(f"💾 [Qdrant] ✅ Successfully stored frame_{data_packet.frame_id}, time: {datetime.now()}")
             print(f"💾 [Qdrant] Position: [{data_packet.position[0]:.3f}, {data_packet.position[1]:.3f}, {data_packet.position[2]:.3f}]")
             print(f"💾 [Qdrant] AI Analysis: {'✅ Success' if ai_success else '❌ Failed'}")
             print(f"💾 [Qdrant] Total stored: {self.stored_count}")
@@ -993,11 +1271,11 @@ class ROS2ImageProcessorGUI:
         
         # 配置
         self.config = self._load_default_config()
-        print(f"🎛️ [GUI] Configuration loaded: {self.config['image_topic']}, {self.config['tf_topic']}")
+        print(f"🎛️ [GUI] Configuration loaded: {self.config['image_topic']}, {self.config['odometry_topic']}")
         
         # ROS2 組件
         self.image_subscriber = None
-        self.tf_subscriber = None
+        self.odometry_subscriber = None
         self.vlm_analyzer = None
         
         # 資料庫管理器字典
@@ -1060,9 +1338,12 @@ class ROS2ImageProcessorGUI:
             'allow_runtime_db_selection': True,  # 是否允許執行時選擇資料庫
             
             # ROS2 配置
-            'image_topic': '/baymax/camera/image_raw',
-            'tf_topic': '/baymax/tf',
-            'target_frame': 'tn__7R05D00002_only_bottom_sim_',
+            'image_topic': '/camera/color/image_raw',
+            'odometry_topic': '/amcl_pose',
+
+            # WebSocket配置
+            'use_websocket': True,  # 是否使用WebSocket而不是直接ROS2
+            'websocket_url': 'ws://localhost:9090',  # rosbridge WebSocket地址
             
             # Ollama 配置
             'ollama_url': 'http://localhost:11434',
@@ -1297,10 +1578,10 @@ class ROS2ImageProcessorGUI:
         
         self.image_count_label = ttk.Label(left_stats, text="📷 接收影像: 0", font=('Arial', 12))
         self.image_count_label.pack(anchor=tk.W, pady=2)
-        
-        self.tf_count_label = ttk.Label(left_stats, text="📡 接收 TF: 0", font=('Arial', 12))
-        self.tf_count_label.pack(anchor=tk.W, pady=2)
-        
+
+        self.odometry_count_label = ttk.Label(left_stats, text="📡 接收里程計: 0", font=('Arial', 12))
+        self.odometry_count_label.pack(anchor=tk.W, pady=2)
+
         self.stored_count_label = ttk.Label(left_stats, text="💾 已存儲: 0", font=('Arial', 12))
         self.stored_count_label.pack(anchor=tk.W, pady=2)
         
@@ -1310,28 +1591,35 @@ class ROS2ImageProcessorGUI:
         
         self.last_image_label = ttk.Label(right_stats, text="📷 最後影像: --", font=('Arial', 10))
         self.last_image_label.pack(anchor=tk.W, pady=2)
-        
-        self.last_tf_label = ttk.Label(right_stats, text="📡 最後 TF: --", font=('Arial', 10))
-        self.last_tf_label.pack(anchor=tk.W, pady=2)
-        
+
+        self.last_odometry_label = ttk.Label(right_stats, text="📡 最後里程計: --", font=('Arial', 10))
+        self.last_odometry_label.pack(anchor=tk.W, pady=2)
+
         self.last_storage_label = ttk.Label(right_stats, text="💾 最後存儲: --", font=('Arial', 10))
         self.last_storage_label.pack(anchor=tk.W, pady=2)
-        
-        # 當前數據包信息
-        current_data_group = ttk.LabelFrame(status_frame, text="當前數據包信息")
-        current_data_group.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        # 數據包信息文本區域
-        self.data_info_text = scrolledtext.ScrolledText(current_data_group, height=8, width=80)
-        self.data_info_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # 實時影像預覽（如果有 PIL）
         if PIL_AVAILABLE:
             preview_group = ttk.LabelFrame(status_frame, text="影像預覽")
-            preview_group.pack(fill=tk.X, padx=10, pady=5)
-            
-            self.image_preview_label = ttk.Label(preview_group, text="無影像", anchor=tk.CENTER)
-            self.image_preview_label.pack(pady=10)
+            preview_group.pack(fill=tk.BOTH, padx=10, pady=5, expand=True)
+
+            # 使用 tk.Label 以便顯示圖片
+            self.image_preview_label = tk.Label(preview_group, text="無影像", anchor=tk.CENTER, bg="#222", fg="#fff")
+            self.image_preview_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # 綁定大小變化事件
+            preview_group.bind('<Configure>', self._on_preview_resize)
+
+            # 用於保存原始 PIL Image
+            self._preview_image_pil = None
+            self._preview_image_tk = None
+
+        # 當前數據包信息（縮小區域）
+        current_data_group = ttk.LabelFrame(status_frame, text="當前數據包信息")
+        current_data_group.pack(fill=tk.X, padx=10, pady=5)
+
+        self.data_info_text = scrolledtext.ScrolledText(current_data_group, height=4, width=80)
+        self.data_info_text.pack(fill=tk.X, padx=10, pady=10)
     
     def _create_config_page(self, notebook):
         """創建配置頁面"""
@@ -1362,19 +1650,31 @@ class ROS2ImageProcessorGUI:
         self.image_topic_var = tk.StringVar(value=self.config['image_topic'])
         ttk.Entry(image_topic_frame, textvariable=self.image_topic_var, width=40).pack(side=tk.LEFT, padx=(5, 0))
         
-        # TF 話題
-        tf_topic_frame = ttk.Frame(ros2_config_group)
-        tf_topic_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(tf_topic_frame, text="TF 話題:", width=15).pack(side=tk.LEFT)
-        self.tf_topic_var = tk.StringVar(value=self.config['tf_topic'])
-        ttk.Entry(tf_topic_frame, textvariable=self.tf_topic_var, width=40).pack(side=tk.LEFT, padx=(5, 0))
+        # Odometry 話題
+        odometry_topic_frame = ttk.Frame(ros2_config_group)
+        odometry_topic_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(odometry_topic_frame, text="定位話題:", width=15).pack(side=tk.LEFT)
+        self.odometry_topic_var = tk.StringVar(value=self.config['odometry_topic'])
+        ttk.Entry(odometry_topic_frame, textvariable=self.odometry_topic_var, width=40).pack(side=tk.LEFT, padx=(5, 0))
         
-        # 目標框架
-        target_frame_frame = ttk.Frame(ros2_config_group)
-        target_frame_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(target_frame_frame, text="目標框架:", width=15).pack(side=tk.LEFT)
-        self.target_frame_var = tk.StringVar(value=self.config['target_frame'])
-        ttk.Entry(target_frame_frame, textvariable=self.target_frame_var, width=40).pack(side=tk.LEFT, padx=(5, 0))
+        # WebSocket配置
+        websocket_config_group = ttk.LabelFrame(scrollable_frame, text="连接方式配置")
+        websocket_config_group.pack(fill=tk.X, padx=10, pady=5)
+
+        # 连接方式选择
+        connection_method_frame = ttk.Frame(websocket_config_group)
+        connection_method_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(connection_method_frame, text="连接方式:", width=15).pack(side=tk.LEFT)
+        self.use_websocket_var = tk.BooleanVar(value=self.config.get('use_websocket', False))
+        ttk.Checkbutton(connection_method_frame, text="使用WebSocket (rosbridge)", 
+                        variable=self.use_websocket_var).pack(side=tk.LEFT, padx=(5, 0))
+
+        # WebSocket URL
+        websocket_url_frame = ttk.Frame(websocket_config_group)
+        websocket_url_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(websocket_url_frame, text="WebSocket URL:", width=15).pack(side=tk.LEFT)
+        self.websocket_url_var = tk.StringVar(value=self.config.get('websocket_url', 'ws://localhost:9090'))
+        ttk.Entry(websocket_url_frame, textvariable=self.websocket_url_var, width=30).pack(side=tk.LEFT, padx=(5, 0))           
         
         # Milvus 配置
         milvus_config_group = ttk.LabelFrame(scrollable_frame, text="Milvus 配置")
@@ -2179,8 +2479,8 @@ class ROS2ImageProcessorGUI:
                     self._add_log(data)
                 elif msg_type == 'image_received':
                     self._update_image_status(data)
-                elif msg_type == 'tf_received':
-                    self._update_tf_status(data)
+                elif msg_type == 'odometry_received':
+                    self._update_odometry_status(data)
                 elif msg_type == 'data_stored':
                     self._update_storage_status(data)
                 elif msg_type == 'milvus_connected':
@@ -2208,15 +2508,15 @@ class ROS2ImageProcessorGUI:
         if PIL_AVAILABLE and hasattr(self, 'image_preview_label'):
             self._update_image_preview()
     
-    def _update_tf_status(self, data):
-        """更新 TF 狀態"""
-        self.status_manager.tf_count = data['count']
-        self.status_manager.last_tf_time = data['timestamp']
-        self.status_manager.tf_received = True
-        
-        self.tf_count_label.config(text=f"📡 接收 TF: {data['count']}")
-        self.last_tf_label.config(text=f"📡 最後 TF: {data['timestamp'].strftime('%H:%M:%S')}")
-        
+    def _update_odometry_status(self, data):
+        """更新里程計狀態"""
+        self.status_manager.odometry_count = data['count']
+        self.status_manager.last_odometry_time = data['timestamp']
+        self.status_manager.odometry_received = True
+
+        self.odometry_count_label.config(text=f"📡 接收里程計: {data['count']}")
+        self.last_odometry_label.config(text=f"📡 最後里程計: {data['timestamp'].strftime('%H:%M:%S')}")
+
         # 更新當前數據包信息
         self._update_current_data_info(data)
     
@@ -2385,7 +2685,7 @@ class ROS2ImageProcessorGUI:
         # 更新詳細信息
         self._update_ollama_info()
     
-    def _update_current_data_info(self, tf_data):
+    def _update_current_data_info(self, odometry_data):
         """更新當前數據包信息"""
         try:
             info_text = "=== 當前數據包信息 ===\n\n"
@@ -2397,17 +2697,15 @@ class ROS2ImageProcessorGUI:
             else:
                 info_text += "📷 影像狀態: 未接收\n\n"
             
-            # TF 信息
-            if self.status_manager.tf_received:
-                info_text += f"📡 TF 狀態: 已接收 {self.status_manager.tf_count} 條\n"
-                info_text += f"📡 最後更新: {self.status_manager.last_tf_time.strftime('%H:%M:%S') if self.status_manager.last_tf_time else 'N/A'}\n"
-                info_text += f"📡 找到目標: {tf_data.get('found_target', False)}\n"
-                info_text += f"📡 可用框架: {', '.join(tf_data.get('available_frames', []))}\n\n"
+            # odometry 信息
+            if self.status_manager.odometry_received:
+                info_text += f"📡 里程計狀態: 已接收 {self.status_manager.odometry_count} 條\n"
+                info_text += f"📡 最後更新: {self.status_manager.last_odometry_time.strftime('%H:%M:%S') if self.status_manager.last_odometry_time else 'N/A'}\n"
             else:
-                info_text += "📡 TF 狀態: 未接收\n\n"
+                info_text += "📡 里程計狀態: 未接收\n\n"
             
             # 同步狀態
-            if self.status_manager.image_received and self.status_manager.tf_received:
+            if self.status_manager.image_received and self.status_manager.odometry_received:
                 info_text += "🔗 同步狀態: ✅ 可同步\n"
             else:
                 info_text += "🔗 同步狀態: ❌ 等待數據\n"
@@ -2432,21 +2730,129 @@ class ROS2ImageProcessorGUI:
     def _update_image_preview(self):
         """更新影像預覽"""
         try:
-            if self.image_subscriber and PIL_AVAILABLE:
+            # 取得最新影像（假設 self.current_data_packet.image 為 PIL Image 或 np.ndarray）
+            if not hasattr(self, 'image_preview_label'):
+                return
+            img_np = None
+            if hasattr(self, 'current_data_packet') and self.current_data_packet is not None:
+                img_np = getattr(self.current_data_packet, 'image', None)
+            elif self.image_subscriber and PIL_AVAILABLE:
                 image, timestamp = self.image_subscriber.get_latest_image()
                 if image is not None:
-                    # 縮放圖像以適應預覽
-                    pil_image = Image.fromarray(image)
-                    pil_image.thumbnail((200, 150), Image.Resampling.LANCZOS)
-                    
-                    # 轉換為 Tkinter 可用格式
-                    photo = ImageTk.PhotoImage(pil_image)
-                    self.image_preview_label.config(image=photo, text="")
-                    self.image_preview_label.image = photo  # 保持引用
+                    img_np = image
+            if img_np is None:
+                self.image_preview_label.config(image='', text='無影像')
+                self._preview_image_pil = None
+                self._preview_image_tk = None
+                return
+
+            # 每次都用原始 np.ndarray 轉 PIL Image，避免累積失真
+            pil_img = Image.fromarray(img_np.astype(np.uint8))
+            self._preview_image_pil = pil_img
+
+            # 取得預覽區域大小
+            w = self.image_preview_label.winfo_width()
+            h = self.image_preview_label.winfo_height()
+            if w < 10 or h < 10:
+                # 還沒顯示出來
+                self.image_preview_label.config(image='', text='無影像')
+                return
+
+            # 等比縮放（每次都用原始 self._preview_image_pil，且不超過原始大小，且不累積失真）
+            if self._preview_image_pil is not None:
+                orig_w, orig_h = self._preview_image_pil.size
+                scale = min(w / orig_w, h / orig_h, 1.0)
+                new_w = int(orig_w * scale)
+                new_h = int(orig_h * scale)
+                img_resized = self._preview_image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                self._preview_image_tk = ImageTk.PhotoImage(img_resized)
+                self.image_preview_label.config(image=self._preview_image_tk, text='')
+                self.image_preview_label.image = self._preview_image_tk
         except Exception as e:
-            pass  # 忽略預覽錯誤
+            self.image_preview_label.config(image='', text='無影像')
+            self._preview_image_pil = None
+            self._preview_image_tk = None
+
+    def _on_preview_resize(self, event):
+        """預覽區域大小變化時，重新縮放影像"""
+        if hasattr(self, '_preview_image_pil') and self._preview_image_pil is not None:
+            try:
+                w = self.image_preview_label.winfo_width()
+                h = self.image_preview_label.winfo_height()
+                orig_w, orig_h = self._preview_image_pil.size
+                scale = min(w / orig_w, h / orig_h, 1.0)
+                new_w = int(orig_w * scale)
+                new_h = int(orig_h * scale)
+                img_resized = self._preview_image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                self._preview_image_tk = ImageTk.PhotoImage(img_resized)
+                self.image_preview_label.config(image=self._preview_image_tk, text='')
+                self.image_preview_label.image = self._preview_image_tk
+            except:
+                pass
     
     def _start_ros2(self):
+        """啟動連接（ROS2或WebSocket）"""
+        if self.config.get('use_websocket', False):
+            return self._start_websocket()
+        else:
+            return self._start_ros2_native()
+
+    def _start_websocket(self):
+        """啟動WebSocket連接"""
+        if not WEBSOCKET_AVAILABLE:
+            messagebox.showerror("錯誤", "WebSocket模組不可用，請安裝: pip install websockets")
+            return
+        
+        if self.ros2_running:
+            return
+        
+        try:
+            self._add_log("🔗 正在連接 WebSocket...")
+            
+            # 應用當前配置
+            self._apply_config()
+            
+            # 創建WebSocket訂閱器
+            websocket_url = self.config['websocket_url']
+            self.image_subscriber = WebSocketCameraSubscriber(
+                self.config['image_topic'], 
+                websocket_url,
+                self.status_queue
+            )
+            self.odometry_subscriber = WebSocketOdometrySubscriber(
+                self.config['odometry_topic'],
+                websocket_url,
+                self.status_queue
+            )
+            
+            # 啟動數據處理線程（保持不變）
+            self.ros2_running = True
+            self.data_thread = threading.Thread(target=self._data_processing_loop, daemon=True)
+            self.data_thread.start()
+            
+            self.web_update_thread = threading.Thread(target=self._web_data_update_loop, daemon=True)
+            self.web_update_thread.start()
+            
+            # 更新UI
+            self.ros2_start_btn.config(state=tk.DISABLED)
+            self.ros2_stop_btn.config(state=tk.NORMAL)
+            self.ros2_status_label.config(text="狀態: WebSocket已連接", foreground="green")
+
+            # 檢查當前資料庫連接
+            current_db_manager = self._get_current_db_manager()
+            if current_db_manager.connected:
+                self.storage_start_btn.config(state=tk.NORMAL)
+                self.manual_store_btn.config(state=tk.NORMAL)
+            else:
+                self._add_log(f"💡 提示: 請先連接 {self.current_db_type.upper()} 以啟用存儲功能")
+
+            self._add_log("✅ WebSocket連接成功")
+
+        except Exception as e:
+            self._add_log(f"❌ WebSocket連接失敗: {e}")
+            messagebox.showerror("錯誤", f"WebSocket連接失敗:\n{e}")
+
+    def _start_ros2_native(self):
         """啟動 ROS2 連接"""
         if not ROS2_AVAILABLE:
             messagebox.showerror("錯誤", "ROS2 模組不可用，請檢查安裝")
@@ -2469,9 +2875,8 @@ class ROS2ImageProcessorGUI:
                 self.config['image_topic'], 
                 self.status_queue
             )
-            self.tf_subscriber = ROS2TFSubscriber(
-                self.config['tf_topic'],
-                self.config['target_frame'],
+            self.odometry_subscriber = ROS2OdometrySubscriber(
+                self.config['odometry_topic'],
                 self.status_queue
             )
             
@@ -2508,74 +2913,80 @@ class ROS2ImageProcessorGUI:
             messagebox.showerror("錯誤", f"ROS2 連接失敗:\n{e}")
     
     def _stop_ros2(self):
-        """停止 ROS2 連接"""
+        """停止連接"""
         if not self.ros2_running:
             return
         
         try:
-            self._add_log("🔌 正在斷開 ROS2...")
+            if self.config.get('use_websocket', False):
+                self._add_log("🔌 正在斷開 WebSocket...")
+            else:
+                self._add_log("🔌 正在斷開 ROS2...")
             
-            # 先停止存儲
+            # 先停止儲存
             if self.storage_running:
                 self._stop_storage()
             
-            # 停止 ROS2
+            # 停止運行標誌
             self.ros2_running = False
-            
+
             # 清理訂閱器
-            if self.image_subscriber:
-                self.image_subscriber.destroy_node()
-                self.image_subscriber = None
+            if hasattr(self.image_subscriber, 'stop'):
+                self.image_subscriber.stop()
+            if hasattr(self.odometry_subscriber, 'stop'):
+                self.odometry_subscriber.stop()
             
-            if self.tf_subscriber:
-                self.tf_subscriber.destroy_node()
-                self.tf_subscriber = None
+            self.image_subscriber = None
+            self.odometry_subscriber = None
             
-            # 關閉 ROS2
-            try:
-                rclpy.shutdown()
-            except:
-                pass
+            # 如果是原生ROS2，關閉rclpy
+            if not self.config.get('use_websocket', False):
+                try:
+                    rclpy.shutdown()
+                except:
+                    pass
             
-            # 更新 UI
+            # 更新UI
             self.ros2_start_btn.config(state=tk.NORMAL)
             self.ros2_stop_btn.config(state=tk.DISABLED)
-            self.ros2_status_label.config(text="狀態: 未連接", foreground="red")
+            status_text = "狀態: 未連接"
+            self.ros2_status_label.config(text=status_text, foreground="red")
             self.storage_start_btn.config(state=tk.DISABLED)
             self.storage_stop_btn.config(state=tk.DISABLED)
             self.manual_store_btn.config(state=tk.DISABLED)
             
-            self._add_log("✅ ROS2 連接已斷開")
-            
+            connection_type = "WebSocket" if self.config.get('use_websocket', False) else "ROS2"
+            self._add_log(f"✅ {connection_type}連接已斷開")
+
         except Exception as e:
-            self._add_log(f"❌ 斷開 ROS2 失敗: {e}")
-    
+            self._add_log(f"❌ 斷開連接失敗: {e}")
+
     def _ros2_loop(self):
         """ROS2 處理循環"""
         while self.ros2_running:
             try:
                 if self.image_subscriber:
                     rclpy.spin_once(self.image_subscriber, timeout_sec=0.05)
-                if self.tf_subscriber:
-                    rclpy.spin_once(self.tf_subscriber, timeout_sec=0.05)
+                if self.odometry_subscriber:
+                    rclpy.spin_once(self.odometry_subscriber, timeout_sec=0.05)
                 time.sleep(0.01)
             except Exception as e:
-                if self.ros2_running:  # 只在運行時報告錯誤
-                    self.status_queue.put(('error', f"ROS2 loop error: {e}"))
-                break
+                print(f"[ROS2 loop] Exception: {e}")  # DEBUG
+                self.status_queue.put(('error', f"ROS2 loop error: {e}"))
+                time.sleep(1.0)  # 等待後重試
     
     def _data_processing_loop(self):
         """數據處理循環"""
         while self.ros2_running:
             try:
                 # 獲取最新數據並創建同步數據包
-                if self.image_subscriber and self.tf_subscriber:
+                if self.image_subscriber and self.odometry_subscriber:
                     image, img_timestamp = self.image_subscriber.get_latest_image()
-                    transform, tf_timestamp = self.tf_subscriber.get_latest_transform()
-                    
+                    transform, odometry_timestamp = self.odometry_subscriber.get_latest_odometry()
+
                     if image is not None and transform is not None:
                         # 創建數據包
-                        coord_info = self.tf_subscriber.extract_coordinates(transform)
+                        coord_info = self.odometry_subscriber.extract_coordinates(transform)
                         unified_timestamp = datetime.now()
                         
                         data_packet = CameraDataPacket(
@@ -2694,8 +3105,9 @@ class ROS2ImageProcessorGUI:
     def _apply_config(self):
         """應用配置"""
         self.config['image_topic'] = self.image_topic_var.get()
-        self.config['tf_topic'] = self.tf_topic_var.get()
-        self.config['target_frame'] = self.target_frame_var.get()
+        self.config['odometry_topic'] = self.odometry_topic_var.get()
+        self.config['use_websocket'] = self.use_websocket_var.get()
+        self.config['websocket_url'] = self.websocket_url_var.get()
         self.config['milvus_host'] = self.milvus_host_var.get()
         self.config['milvus_port'] = self.milvus_port_var.get()
         self.config['collection_name'] = self.collection_name_var.get()
@@ -2733,8 +3145,9 @@ class ROS2ImageProcessorGUI:
                 
                 # 更新 UI
                 self.image_topic_var.set(self.config['image_topic'])
-                self.tf_topic_var.set(self.config['tf_topic'])
-                self.target_frame_var.set(self.config['target_frame'])
+                self.odometry_topic_var.set(self.config['odometry_topic'])
+                self.use_websocket_var.set(self.config.get('use_websocket', False)) 
+                self.websocket_url_var.set(self.config.get('websocket_url', 'ws://localhost:9090')) 
                 self.milvus_host_var.set(self.config['milvus_host'])
                 self.milvus_port_var.set(self.config['milvus_port'])
                 self.collection_name_var.set(self.config['collection_name'])
