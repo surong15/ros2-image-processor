@@ -1,7 +1,7 @@
 # external_processor/config/processor_config.yaml
 # ROS2 Topics
-image_topic: "/baymax/camera/image_raw"
-tf_topic: "/baymax/tf"
+image_topic: "/ROBOTNAME/camera/image_raw"
+tf_topic: "/ROBOTNAME/tf"
 target_frame: "tn__7R05D00002_only_bottom_sim_"
 
 # Ollama VLM Settings
