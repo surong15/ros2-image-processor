@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # milvus一直斷線，好像比之前嚴重
 # web查看器不會根據時間順序排序
-# 用web socket取得realsense畫面，八樓baymax座標
+# 用web socket取得realsense畫面，八樓ROBOTNAME座標
 
 """
 ROS2 Image Processor GUI Application
