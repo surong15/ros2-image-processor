@@ -431,8 +431,8 @@ if self.test_mode:
 
 | 參數            | 預設值                          | 說明                     |
 |-----------------|----------------------------------|--------------------------|
-| 圖像話題        | `/baymax/camera/image_raw`       | ROS2攝像頭話題           |
-| TF話題          | `/baymax/tf`                     | ROS2 TF座標話題          |
+| 圖像話題        | `/ROBOTNAME/camera/image_raw`       | ROS2攝像頭話題           |
+| TF話題          | `/ROBOTNAME/tf`                     | ROS2 TF座標話題          |
 | 目標座標框架    | `tn__7R05D00002_only_bottom_sim_`| 機器人基座座標系         |
 | Collection Name | `ros2_camera_images`             | 向量資料庫集合名稱       |
 | Milvus Host     | `localhost`                      | Milvus伺服器主機         |
@@ -452,8 +452,8 @@ if self.test_mode:
 
 ```yaml
 # ROS2設定
-image_topic: '/baymax/camera/image_raw'
-tf_topic: '/baymax/tf'  
+image_topic: '/ROBOTNAME/camera/image_raw'
+tf_topic: '/ROBOTNAME/tf'  
 target_frame: 'tn__7R05D00002_only_bottom_sim_'
 
 # 數據庫設定
