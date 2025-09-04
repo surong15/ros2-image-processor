@@ -1060,8 +1060,8 @@ class ROS2ImageProcessorGUI:
             'allow_runtime_db_selection': True,  # 是否允許執行時選擇資料庫
             
             # ROS2 配置
-            'image_topic': '/baymax/camera/image_raw',
-            'tf_topic': '/baymax/tf',
+            'image_topic': '/ROBOTNAME/camera/image_raw',
+            'tf_topic': '/ROBOTNAME/tf',
             'target_frame': 'tn__7R05D00002_only_bottom_sim_',
             
             # Ollama 配置
